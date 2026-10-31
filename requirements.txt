@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+httpx
+pytest
+pytest-cov
+mutmut
+flake8
