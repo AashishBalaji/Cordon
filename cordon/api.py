@@ -8,13 +8,23 @@ endpoints (/ops/*) a human would actually watch.
 
 from __future__ import annotations
 
+from dataclasses import asdict
+
 from fastapi import FastAPI, Header, HTTPException, Response
 from pydantic import BaseModel
 
 from .budget import BudgetExceeded
 from .metrics import render_metrics
 from .service import CaseNotFound, CaseService
-from .slo import SLO, check_all_tenants, compute_burn_rate, throttled_fraction
+from .slo import (
+    SLO,
+    MultiWindowSLO,
+    check_all_tenants,
+    check_all_tenants_multi_window,
+    compute_burn_rate,
+    evaluate_multi_window,
+    throttled_fraction,
+)
 
 app = FastAPI(
     title="cordon",
@@ -26,6 +36,10 @@ service = CaseService()
 # measured over a 5-minute rolling window. One SLO, one window -- the
 # scope this project actually implements (see slo.py's own docstring).
 DEFAULT_SLO = SLO(name="availability", target=0.995, window_seconds=300.0)
+
+# The production paging decision: multi-window, multi-burn-rate rules
+# (see slo.py) layered on top of the same single SLO target above.
+DEFAULT_MULTI_WINDOW_SLO = MultiWindowSLO(slo=DEFAULT_SLO)
 
 
 class CreateCaseRequest(BaseModel):
@@ -82,10 +96,22 @@ def ops_headroom(x_tenant_id: str = Header(...)):
 
 @app.get("/ops/burn-rate")
 def ops_burn_rate(x_tenant_id: str = Header(...)):
-    """SLO burn rate for one tenant -- the number that decides
-    whether to page, not the raw error count."""
+    """Single-window SLO burn rate for one tenant -- the simple
+    building block. /ops/burn-rate-multi-window is the actual paging
+    decision; this stays for the single number on its own."""
     result = compute_burn_rate(service.telemetry, x_tenant_id, DEFAULT_SLO)
     return result.__dict__
+
+
+@app.get("/ops/burn-rate-multi-window")
+def ops_burn_rate_multi_window(x_tenant_id: str = Header(...)):
+    """The real paging decision: multi-window, multi-burn-rate rules
+    (see slo.py) -- pages only when a fast-burn or slow-burn rule's
+    long AND short windows both agree, so a single noisy window
+    doesn't page on its own and a resolved incident stops paging as
+    soon as the short window clears."""
+    result = evaluate_multi_window(service.telemetry, x_tenant_id, DEFAULT_MULTI_WINDOW_SLO)
+    return asdict(result)
 
 
 @app.get("/ops/throttled-fraction")
@@ -99,10 +125,19 @@ def ops_throttled_fraction(x_tenant_id: str = Header(...)):
 
 @app.get("/ops/sweep")
 def ops_sweep():
-    """Every known tenant's burn rate in one call -- the actual
-    on-call sweep, so a paging tenant surfaces without having to be
-    asked about by name."""
+    """Every known tenant's single-window burn rate in one call."""
     return [r.__dict__ for r in check_all_tenants(service.telemetry, DEFAULT_SLO)]
+
+
+@app.get("/ops/sweep-multi-window")
+def ops_sweep_multi_window():
+    """Every known tenant's multi-window paging decision in one call
+    -- the actual on-call sweep, so a genuinely paging tenant
+    surfaces without having to be asked about by name."""
+    return [
+        asdict(r)
+        for r in check_all_tenants_multi_window(service.telemetry, DEFAULT_MULTI_WINDOW_SLO)
+    ]
 
 
 @app.get("/metrics")

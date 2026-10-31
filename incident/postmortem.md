@@ -42,12 +42,42 @@ on paper: a tenant sending far more load than its budget allows is
 contained without being treated as an outage, and a second tenant
 sharing the same process is provably unaffected.
 
-What it does **not** demonstrate: behavior under real concurrent
-load (this ran single-threaded, sequentially), behavior across
-multiple service instances (there is one process, one `BudgetRegistry`,
-no distributed state), or anything about a real customer's real
-traffic pattern. Those are the honest limits of a simulation run in
-a sandbox, not claims this project makes about production readiness.
+What it does **not** demonstrate: behavior across multiple service
+instances (there is one process, one `BudgetRegistry`, no distributed
+state), or anything about a real customer's real traffic pattern.
+Those are the honest limits of a simulation run in a sandbox, not
+claims this project makes about production readiness.
+
+## Update: real concurrent load, and a race this surfaced
+
+The gap above originally also listed "behavior under real concurrent
+load (this ran single-threaded, sequentially)" as undemonstrated.
+`scripts/concurrent_load_test.py` closes it: the same noisy/quiet
+scenario, but all 95 requests from both tenants submitted at once to
+a 32-worker real `ThreadPoolExecutor`, not a sequential loop. Real
+output (`incident/concurrent_load_output.json`): identical result to
+the sequential run -- noisy-tenant 50 accepted / 30 throttled,
+quiet-tenant 15/15 untouched -- now proven to hold under genuine
+concurrent access, not just sequential calls.
+
+**Honest finding from building this:** it didn't hold by default.
+`TenantBudget.charge()`'s original check-then-take sequence (read
+`available()`, then separately call `take()`) was a real,
+reproducible race under actual threads -- 200 concurrent threads
+charging a capacity-10 bucket with no refill reliably produced 11+
+accepted requests, not 10. `BudgetRegistry.get()`'s lazy
+tenant-bucket creation had the same shape of bug: two threads racing
+to be "first" for a brand-new tenant could each construct their own
+`TenantBudget`, with whichever lost silently discarding a tenant's
+in-flight budget state. Both are fixed in `cordon/budget.py` with
+plain `threading.Lock`s (a per-tenant lock around `charge()`/
+`headroom()`, a short registry-wide lock around first-creation only,
+so two different tenants never contend on the same lock) --
+`cordon/telemetry.py` got the same treatment for the same reason
+(`record()` appending while `events_in_window()` rewrites the same
+list in place). `tests/test_concurrency.py` tests each of these
+directly with real threads, including reproducing the exact race
+shape above against the fixed code to confirm it no longer overdraws.
 
 ## If this were real: the root cause and the fix
 

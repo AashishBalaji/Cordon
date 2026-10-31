@@ -11,17 +11,26 @@ actually spending that budget right now, and only alert when the
 *rate* of spending -- not the raw error count -- means the tenant
 will blow through its whole budget too fast to be a shrug.
 
-Scope, stated plainly: real multi-window multi-burn-rate alerting
-(Google's SRE workbook) checks several window/threshold pairs at
-once to catch both sudden spikes and slow leaks without flapping.
-This implements one window with one threshold -- the core idea,
-not the full production design -- and says so rather than
-pretending otherwise.
+`compute_burn_rate` below is the single-window primitive: one
+window, one threshold. That alone has a real flapping problem --
+a single long window is slow to both alert and recover (an incident
+that ends still "looks" bad until the window fully rolls past it),
+and a single short window pages on noise. Google's SRE workbook
+fixes this with **multi-window, multi-burn-rate alerting**: pair a
+long window (catches slow, sustained leaks) with a short window at
+the same threshold (confirms the leak is still happening right now,
+so recovery is fast), and only page when *both* agree. This module
+implements that on top of the single-window primitive --
+`MultiWindowSLO`, `BurnRateRule`, and `evaluate_multi_window` below
+-- using the same long:short ratio (12:1) and the same two
+thresholds (14.4 and 6.0) Google's workbook uses, scaled down to
+windows that fit this project's in-memory retention instead of the
+original hour/day windows.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List
 
 from .telemetry import ERROR, THROTTLED, TelemetryStore
@@ -121,4 +130,120 @@ def check_all_tenants(
     if nobody thought to ask about it by name."""
     return [
         compute_burn_rate(telemetry, tenant_id, slo, now) for tenant_id in telemetry.known_tenants()
+    ]
+
+
+@dataclass(frozen=True)
+class BurnRateRule:
+    """One long/short window pair and the threshold both must clear
+    before this rule fires. `name` is just a label for which kind of
+    leak this rule is tuned for (a sudden spike vs. a slow burn)."""
+
+    name: str
+    long_window_seconds: float
+    short_window_seconds: float
+    threshold: float
+
+
+# Google's SRE workbook pairs: a 1h/5m fast-burn rule at 14.4x (a
+# sudden spike exhausts the 30-day budget in under a day) and a
+# 6h/30m slow-burn rule at 6x (a slow leak exhausts it in a few
+# days). Same ratio (12:1) and same thresholds here, scaled down to
+# windows that fit comfortably inside this project's default
+# 900-second telemetry retention instead of hours and days.
+DEFAULT_MULTI_WINDOW_RULES: List[BurnRateRule] = [
+    BurnRateRule(name="fast_burn", long_window_seconds=60.0, short_window_seconds=5.0,
+                 threshold=14.4),
+    BurnRateRule(name="slow_burn", long_window_seconds=300.0, short_window_seconds=25.0,
+                 threshold=6.0),
+]
+
+
+@dataclass(frozen=True)
+class MultiWindowSLO:
+    """An SLO plus the set of burn-rate rules checked against it.
+    `slo.window_seconds` isn't used for the multi-window check itself
+    (each rule brings its own windows) -- it's kept so the single
+    SLO target/error_budget is defined in one place and single-window
+    callers (compute_burn_rate, the existing /ops/burn-rate endpoint)
+    and multi-window callers agree on what "99.5% availability" means."""
+
+    slo: SLO
+    rules: List[BurnRateRule] = field(default_factory=lambda: list(DEFAULT_MULTI_WINDOW_RULES))
+
+
+@dataclass(frozen=True)
+class RuleResult:
+    rule_name: str
+    long_window_burn_rate: BurnRateResult
+    short_window_burn_rate: BurnRateResult
+    triggered: bool  # both windows independently clear this rule's threshold
+
+
+@dataclass(frozen=True)
+class MultiWindowResult:
+    tenant_id: str
+    slo_name: str
+    rule_results: List[RuleResult]
+    should_page: bool  # True if ANY rule triggered
+
+
+def evaluate_multi_window(
+    telemetry: TelemetryStore,
+    tenant_id: str,
+    multi_window_slo: MultiWindowSLO,
+    now: float | None = None,
+) -> MultiWindowResult:
+    """The actual multi-window, multi-burn-rate check: for each rule,
+    compute burn rate over both its long and short window, and only
+    count the rule as triggered if both independently clear its
+    threshold. Requiring both is what buys the fast-recovery property
+    a single long window doesn't have -- once the short window's
+    burn rate drops back down, the rule stops firing immediately,
+    even though the long window is still "contaminated" by the
+    incident for a while longer."""
+    rule_results = []
+    for rule in multi_window_slo.rules:
+        # Both windows share the base SLO's target/error_budget; only
+        # window_seconds and the rule's own threshold differ between
+        # the long and short check, so build throwaway SLOs per window.
+        short_slo = SLO(
+            name=multi_window_slo.slo.name,
+            target=multi_window_slo.slo.target,
+            window_seconds=rule.short_window_seconds,
+        )
+        long_slo = SLO(
+            name=multi_window_slo.slo.name,
+            target=multi_window_slo.slo.target,
+            window_seconds=rule.long_window_seconds,
+        )
+        long_result = compute_burn_rate(
+            telemetry, tenant_id, long_slo, now=now, page_threshold=rule.threshold,
+        )
+        short_result = compute_burn_rate(
+            telemetry, tenant_id, short_slo, now=now, page_threshold=rule.threshold,
+        )
+        triggered = long_result.should_page and short_result.should_page
+        rule_results.append(RuleResult(
+            rule_name=rule.name,
+            long_window_burn_rate=long_result,
+            short_window_burn_rate=short_result,
+            triggered=triggered,
+        ))
+    return MultiWindowResult(
+        tenant_id=tenant_id,
+        slo_name=multi_window_slo.slo.name,
+        rule_results=rule_results,
+        should_page=any(r.triggered for r in rule_results),
+    )
+
+
+def check_all_tenants_multi_window(
+    telemetry: TelemetryStore, multi_window_slo: MultiWindowSLO, now: float | None = None
+) -> List[MultiWindowResult]:
+    """Multi-window equivalent of check_all_tenants: one on-call
+    sweep call covering every tenant telemetry has seen."""
+    return [
+        evaluate_multi_window(telemetry, tenant_id, multi_window_slo, now)
+        for tenant_id in telemetry.known_tenants()
     ]

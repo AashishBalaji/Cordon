@@ -24,7 +24,7 @@ from prometheus_client import CollectorRegistry, generate_latest
 from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
 
 from .budget import BudgetRegistry
-from .slo import SLO, compute_burn_rate
+from .slo import SLO, MultiWindowSLO, compute_burn_rate, evaluate_multi_window
 from .telemetry import ERROR, SUCCESS, THROTTLED, TelemetryStore
 
 
@@ -38,6 +38,7 @@ class CordonCollector:
         self._telemetry = telemetry
         self._budgets = budgets
         self._slo = slo
+        self._multi_window_slo = MultiWindowSLO(slo=slo)
 
     def collect(self):
         tenants = self._telemetry.known_tenants()
@@ -72,6 +73,19 @@ class CordonCollector:
             should_page.add_metric([tenant_id], 1.0 if result.should_page else 0.0)
         yield burn_rate
         yield should_page
+
+        should_page_multi_window = GaugeMetricFamily(
+            "cordon_slo_should_page_multi_window",
+            "Whether this tenant's fast-burn or slow-burn multi-window rule has "
+            "triggered (1) or not (0) -- the real paging decision, see slo.py.",
+            labels=["tenant_id"],
+        )
+        for tenant_id in tenants:
+            mw_result = evaluate_multi_window(self._telemetry, tenant_id, self._multi_window_slo)
+            should_page_multi_window.add_metric(
+                [tenant_id], 1.0 if mw_result.should_page else 0.0
+            )
+        yield should_page_multi_window
 
         headroom = GaugeMetricFamily(
             "cordon_budget_headroom_ratio",

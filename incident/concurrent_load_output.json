@@ -1,0 +1,34 @@
+{
+  "scenario": "Same noisy/quiet-tenant scenario as simulate_noisy_tenant.py, but all 95 requests from both tenants submitted at once to a 32-worker real thread pool, not run sequentially in a loop.",
+  "noisy_tenant": {
+    "requests_sent": 80,
+    "outcomes": {
+      "success": 50,
+      "throttled": 30
+    },
+    "slo_burn_rate": 0.0,
+    "slo_should_page": false,
+    "headroom": {
+      "request_rate": 0.002858867799932341,
+      "resource_cost": 0.6939588677999348
+    }
+  },
+  "quiet_tenant": {
+    "requests_sent": 15,
+    "outcomes": {
+      "success": 15,
+      "throttled": 0
+    },
+    "slo_burn_rate": 0.0,
+    "slo_should_page": false,
+    "headroom": {
+      "request_rate": 0.7009430864000024,
+      "resource_cost": 0.9081930864000026
+    }
+  },
+  "concurrency_correctness_check": {
+    "rate_budget_capacity": 50,
+    "noisy_successes": 50,
+    "accepted_never_exceeds_capacity": true
+  }
+}

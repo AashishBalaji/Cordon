@@ -60,3 +60,15 @@ def test_burn_rate_and_should_page_present_per_tenant():
     body = render_metrics(telemetry, BudgetRegistry(), SLO_DEF).decode()
     assert 'cordon_slo_burn_rate{tenant_id="acme"}' in body
     assert 'cordon_slo_should_page{tenant_id="acme"} 1.0' in body
+
+
+def test_multi_window_should_page_gauge_present_per_tenant():
+    # Same real-clock caveat as the single-window test above: enough
+    # dense, sustained errors that both the fast-burn and slow-burn
+    # rules' short windows clear MIN_REQUESTS_FOR_SIGNAL.
+    telemetry = TelemetryStore()
+    for _ in range(40):
+        telemetry.record("acme", latency_ms=1.0, outcome=ERROR)
+
+    body = render_metrics(telemetry, BudgetRegistry(), SLO_DEF).decode()
+    assert 'cordon_slo_should_page_multi_window{tenant_id="acme"}' in body

@@ -3,7 +3,15 @@ whether telemetry is worth paging a human for."""
 
 import pytest
 
-from cordon.slo import SLO, compute_burn_rate, throttled_fraction
+from cordon.slo import (
+    SLO,
+    DEFAULT_MULTI_WINDOW_RULES,
+    MultiWindowSLO,
+    check_all_tenants_multi_window,
+    compute_burn_rate,
+    evaluate_multi_window,
+    throttled_fraction,
+)
 from cordon.telemetry import ERROR, SUCCESS, THROTTLED, TelemetryStore
 
 
@@ -80,3 +88,71 @@ def test_tenants_are_isolated_in_burn_rate_too():
     quiet = compute_burn_rate(store, "quiet", _slo(target=0.99), now=20.0)
     assert noisy.should_page is True
     assert quiet.should_page is False
+
+
+# -- Multi-window, multi-burn-rate rules (slo.py's upgrade over the
+# single-window primitive above) --------------------------------------
+
+def test_default_rules_are_fast_and_slow_burn_at_googles_ratios():
+    names = [r.name for r in DEFAULT_MULTI_WINDOW_RULES]
+    assert names == ["fast_burn", "slow_burn"]
+    for rule in DEFAULT_MULTI_WINDOW_RULES:
+        # Same 12:1 long:short ratio Google's SRE workbook uses.
+        assert rule.long_window_seconds == rule.short_window_seconds * 12
+
+
+def test_multi_window_no_requests_never_pages():
+    store = TelemetryStore()
+    mw_slo = MultiWindowSLO(slo=_slo(target=0.99))
+    result = evaluate_multi_window(store, "t1", mw_slo, now=0.0)
+    assert result.should_page is False
+    assert all(not r.triggered for r in result.rule_results)
+
+
+def test_multi_window_pages_only_when_both_long_and_short_window_agree():
+    # Sustained 50% errors, dense enough to clear MIN_REQUESTS_FOR_SIGNAL
+    # in every rule's short window too, across the whole 300s span.
+    store = TelemetryStore()
+    for i in range(300):
+        outcome = ERROR if i % 2 == 0 else SUCCESS
+        store.record("t1", latency_ms=1.0, outcome=outcome, now=float(i))
+    mw_slo = MultiWindowSLO(slo=_slo(target=0.99))
+    result = evaluate_multi_window(store, "t1", mw_slo, now=299.0)
+    assert result.should_page is True
+    slow_burn = next(r for r in result.rule_results if r.rule_name == "slow_burn")
+    assert slow_burn.triggered is True
+    assert slow_burn.long_window_burn_rate.should_page is True
+    assert slow_burn.short_window_burn_rate.should_page is True
+
+
+def test_short_window_recovery_stops_paging_despite_contaminated_long_window():
+    # An incident that already ended: a burst of errors early on, then
+    # clean traffic right up to "now". The long window still sees the
+    # old errors and looks unhealthy on its own; the short window is
+    # clean. Multi-window requires BOTH to agree, so this must not page
+    # -- the whole point of pairing the windows is fast recovery.
+    store = TelemetryStore()
+    for i in range(300):
+        outcome = ERROR if i < 50 else SUCCESS
+        store.record("t1", latency_ms=1.0, outcome=outcome, now=float(i))
+    mw_slo = MultiWindowSLO(slo=_slo(target=0.99))
+    result = evaluate_multi_window(store, "t1", mw_slo, now=299.0)
+    slow_burn = next(r for r in result.rule_results if r.rule_name == "slow_burn")
+    assert slow_burn.long_window_burn_rate.should_page is True  # still "contaminated"
+    assert slow_burn.short_window_burn_rate.should_page is False  # already recovered
+    assert slow_burn.triggered is False
+    assert result.should_page is False
+
+
+def test_multi_window_tenants_are_isolated():
+    store = TelemetryStore()
+    for i in range(300):
+        store.record("noisy", latency_ms=1.0, outcome=ERROR, now=float(i))
+    for i in range(300):
+        store.record("quiet", latency_ms=1.0, outcome=SUCCESS, now=float(i))
+    mw_slo = MultiWindowSLO(slo=_slo(target=0.99))
+    results = {
+        r.tenant_id: r for r in check_all_tenants_multi_window(store, mw_slo, now=299.0)
+    }
+    assert results["noisy"].should_page is True
+    assert results["quiet"].should_page is False

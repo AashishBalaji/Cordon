@@ -31,14 +31,16 @@ HTTP by `cordon/api.py`) where every request is routed through a
 2. `cordon/telemetry.py` -- every request's outcome (success, error,
    or throttled) recorded per tenant, kept in a rolling window.
 3. `cordon/slo.py` -- an SRE-style **error-budget burn rate** per
-   tenant, computed from that telemetry. The standard problem with
-   naive alerting ("page if error rate > 1%") is alert fatigue:
-   thresholds fire on noise until people stop trusting them. Burn
-   rate fixes this by asking how *fast* a tenant is spending its
-   error budget, not just how many errors happened -- and a tenant
-   correctly throttled by its own budget is deliberately excluded
-   from this calculation, because that's the system working, not an
-   incident.
+   tenant, computed from that telemetry, escalated to **multi-window,
+   multi-burn-rate** alerting (Google's SRE workbook technique -- see
+   below) so a single noisy window doesn't page and a resolved
+   incident stops paging fast. The standard problem with naive
+   alerting ("page if error rate > 1%") is alert fatigue: thresholds
+   fire on noise until people stop trusting them. Burn rate fixes
+   this by asking how *fast* a tenant is spending its error budget,
+   not just how many errors happened -- and a tenant correctly
+   throttled by its own budget is deliberately excluded from this
+   calculation, because that's the system working, not an incident.
 4. `cordon/api.py` -- a thin FastAPI wrapper, plus `/ops/*` endpoints
    (`headroom`, `burn-rate`, `throttled-fraction`, `sweep`) exposing
    exactly what an on-call engineer would actually want to look at,
@@ -50,7 +52,7 @@ HTTP by `cordon/api.py`) where every request is routed through a
 
 ## Test automation: coverage, mutation testing, and CI enforcing both
 
-65 tests, 99% statement coverage, flake8 clean -- and a GitHub
+79 tests, 99% statement coverage, flake8 clean -- and a GitHub
 Actions pipeline (`.github/workflows/ci.yml`, badge above) running
 all of it, plus a mutation-testing gate, on every push. Coverage
 alone is a weak signal -- a line can be "covered" by a test that
@@ -63,15 +65,16 @@ is the real automation metric the JD is pointing at with "drive up
 code coverage and automation metrics," not coverage alone.
 
 **Real finding, run against the full suite (`python3 -m mutmut
-run`):** 513 mutants generated across all of `cordon/`, including
-`metrics.py` and `mutation_gate.py` added for the Prometheus endpoint
-and the CI gate itself. 398 killed, 115 survived -- **77.6%**. CI now
-enforces a **70% floor** on this score on every push
+run`):** 616 mutants generated across all of `cordon/` (the count
+keeps growing with the project -- `metrics.py`/`mutation_gate.py` for
+the Prometheus endpoint and CI gate, then the multi-window SLO logic
+and the concurrency locks added after). 484 killed, 132 survived --
+**78.6%**. CI enforces a **70% floor** on this score on every push
 (`cordon/mutation_gate.py`, `scripts/check_mutation_score.py`,
 `.github/workflows/ci.yml`): a pull request that weakens the test
 suite enough to drop the score below that floor fails the build.
 
-**Honest note on the remaining 115 survivors:** a sample of them
+**Honest note on the remaining 132 survivors:** a sample of them
 (`python3 -m mutmut show <id>`) turned out to be *equivalent
 mutants* -- for example, replacing `now = now if now is not None
 else time.monotonic()` with `now = None` in `budget.py`, which
@@ -83,7 +86,7 @@ writing tests that encode the mutation tool's blind spots rather
 than anything real about the code. That's also why the CI gate is a
 **floor, not a ratchet**: a ratchet that demanded the score only ever
 go up would eventually require killing mutants that can't be killed.
-77.6% against a reviewed set of survivors, with a floor catching real
+78.6% against a reviewed set of survivors, with a floor catching real
 regressions, is the honest design, not a chased 100%.
 
 ## Telemetry and the noisy-tenant incident
@@ -108,6 +111,38 @@ numbers from real code, not asserted in prose: isolation holds, and
 the telemetry layer can tell the difference between "a tenant is
 being correctly contained" and "something is actually broken."
 
+**Update -- real concurrent load:** `scripts/concurrent_load_test.py`
+re-runs the identical scenario through a real 32-worker thread pool
+(all 95 requests from both tenants submitted at once, not in a
+sequential loop) instead of the single-threaded version above, and
+gets the same result: 50/80 accepted for noisy-tenant, 15/15 for
+quiet-tenant, confirmed under genuine concurrency this time
+(`incident/concurrent_load_output.json`). Building this surfaced a
+real, reproducible check-then-take race in the original
+`TenantBudget.charge()` and a matching one in `BudgetRegistry.get()`'s
+lazy bucket creation -- both are fixed in `cordon/budget.py` with
+per-tenant `threading.Lock`s, and `tests/test_concurrency.py`
+reproduces and confirms the fix for each directly with real threads.
+
+## SLO alerting: from single-window to multi-window, multi-burn-rate
+
+The single-window burn rate above (`compute_burn_rate`) is the
+building block, not the paging decision: a single window is slow to
+both alert and recover, and pairing it with a matching short window
+(Google's SRE workbook's multi-window, multi-burn-rate technique) is
+what actually ships. `cordon/slo.py`'s `evaluate_multi_window` checks
+two rules -- a fast-burn rule (1-minute/5-second windows at 14.4x)
+and a slow-burn rule (5-minute/25-second windows at 6x), the same
+12:1 ratio and thresholds Google's workbook uses, scaled down to fit
+this project's in-memory retention -- and only pages when a rule's
+long AND short window both independently clear its threshold.
+`/ops/burn-rate-multi-window` and `/ops/sweep-multi-window` expose
+it over HTTP, and `cordon_slo_should_page_multi_window` carries it in
+`/metrics`. `tests/test_slo.py` includes the property this design is
+actually for: an incident whose errors are now outside the short
+window but still inside the long one does **not** page, because the
+long window alone isn't enough -- fast recovery is the point.
+
 ## Honest scope, stated plainly
 
 - This is a portfolio project built to demonstrate engineering
@@ -115,12 +150,9 @@ being correctly contained" and "something is actually broken."
   a claim to have rebuilt Apex's governor limits or any part of
   Salesforce's real infrastructure.
 - The simulation in `incident/` is synthetic and single-process --
-  real concurrent load, multiple service instances, or real customer
-  traffic patterns are out of scope, and the postmortem says so.
-- SLO burn-rate alerting here implements one window with one
-  threshold -- the core SRE technique, not the full multi-window
-  multi-burn-rate design real production systems use (see
-  `cordon/slo.py`'s own docstring).
+  real concurrent load (within one process) is now covered (see
+  above), but multiple service instances or real customer traffic
+  patterns are still out of scope, and the postmortem says so.
 - The in-memory store (`CaseService._cases`) is not a real database;
   this project is about the isolation and telemetry layers, not
   persistence.
@@ -133,6 +165,7 @@ python3 -m pytest -q --cov=cordon --cov-report=term-missing   # tests + coverage
 flake8 --max-line-length=100 cordon tests scripts              # lint
 python3 -m mutmut run && python3 -m mutmut results             # mutation testing
 python3 scripts/simulate_noisy_tenant.py                       # the incident simulation
+python3 scripts/concurrent_load_test.py                        # the same, under real concurrency
 uvicorn cordon.api:app --reload                                 # run the API itself
 ```
 

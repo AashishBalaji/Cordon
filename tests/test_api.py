@@ -76,6 +76,23 @@ def test_ops_burn_rate_endpoint_shape(client):
     assert set(body.keys()) >= {"tenant_id", "burn_rate", "should_page", "request_count"}
 
 
+def test_ops_burn_rate_multi_window_endpoint_shape(client):
+    resp = client.get("/ops/burn-rate-multi-window", headers={"X-Tenant-Id": "acme"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert set(body.keys()) >= {"tenant_id", "slo_name", "rule_results", "should_page"}
+    assert {r["rule_name"] for r in body["rule_results"]} == {"fast_burn", "slow_burn"}
+
+
+def test_ops_sweep_multi_window_includes_every_known_tenant(client):
+    client.post("/cases", json={"subject": "a"}, headers={"X-Tenant-Id": "acme"})
+    client.post("/cases", json={"subject": "b"}, headers={"X-Tenant-Id": "globex"})
+    resp = client.get("/ops/sweep-multi-window")
+    assert resp.status_code == 200
+    tenant_ids = {row["tenant_id"] for row in resp.json()}
+    assert {"acme", "globex"} <= tenant_ids
+
+
 def test_list_cases_over_http(client):
     client.post("/cases", json={"subject": "a"}, headers={"X-Tenant-Id": "acme"})
     client.post("/cases", json={"subject": "b"}, headers={"X-Tenant-Id": "acme"})
