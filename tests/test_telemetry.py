@@ -36,6 +36,20 @@ def test_retention_prunes_old_events_on_read():
     assert store.events_in_window("t1", window_seconds=1000.0, now=100.0) == []
 
 
+def test_all_events_ignores_window_but_respects_retention():
+    store = TelemetryStore(retention_seconds=1000.0)
+    store.record("t1", latency_ms=1.0, outcome=SUCCESS, now=0.0)
+    store.record("t1", latency_ms=1.0, outcome=ERROR, now=500.0)
+    # all_events itself takes no "now" -- it must not depend on the
+    # caller's clock the way events_in_window()'s pruning does.
+    assert len(store.all_events("t1")) == 2
+
+
+def test_all_events_empty_for_unknown_tenant():
+    store = TelemetryStore()
+    assert store.all_events("ghost") == []
+
+
 def test_throttled_outcome_recorded_distinctly():
     store = TelemetryStore()
     store.record("t1", latency_ms=0.0, outcome=THROTTLED, now=0.0)

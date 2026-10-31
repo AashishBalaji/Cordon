@@ -148,6 +148,15 @@ def test_ops_sweep_includes_every_known_tenant(client):
     assert {"acme", "globex"} <= tenant_ids
 
 
+def test_metrics_endpoint_returns_prometheus_text_format(client):
+    client.post("/cases", json={"subject": "a"}, headers={"X-Tenant-Id": "acme"})
+    resp = client.get("/metrics")
+    assert resp.status_code == 200
+    assert "text/plain" in resp.headers["content-type"]
+    assert "cordon_requests_total" in resp.text
+    assert 'tenant_id="acme"' in resp.text
+
+
 def test_a_noisy_tenant_does_not_affect_another_tenants_headroom(client):
     import cordon.api as api_module
 

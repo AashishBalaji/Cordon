@@ -59,3 +59,11 @@ class TelemetryStore:
 
     def known_tenants(self) -> List[str]:
         return list(self._events.keys())
+
+    def all_events(self, tenant_id: str) -> List[RequestEvent]:
+        """Every retained event for this tenant, with no window
+        cutoff -- for callers (metrics.py) that want "since process
+        start" counts rather than a recent window, and that must not
+        depend on how the caller's own clock relates to retention,
+        the way events_in_window()'s pruning does."""
+        return list(self._events.get(tenant_id, []))

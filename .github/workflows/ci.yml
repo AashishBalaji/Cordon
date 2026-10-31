@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - run: python -m pytest -q --cov=cordon --cov-report=term-missing
+      - run: flake8 --max-line-length=100 cordon tests scripts
+
+  mutation-testing:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      # mutmut run exits non-zero whenever any mutant survives, which is
+      # the normal case, not a tool failure -- the real pass/fail gate is
+      # the mutation-score floor checked below, not this exit code.
+      - run: python -m mutmut run --max-children 4 || true
+      - run: python -m mutmut export-cicd-stats
+      - run: python scripts/check_mutation_score.py mutants/mutmut-cicd-stats.json 0.70
+      - if: always()
+        run: python -m mutmut results

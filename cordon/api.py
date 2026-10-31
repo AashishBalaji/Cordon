@@ -8,10 +8,11 @@ endpoints (/ops/*) a human would actually watch.
 
 from __future__ import annotations
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Response
 from pydantic import BaseModel
 
 from .budget import BudgetExceeded
+from .metrics import render_metrics
 from .service import CaseNotFound, CaseService
 from .slo import SLO, check_all_tenants, compute_burn_rate, throttled_fraction
 
@@ -102,3 +103,12 @@ def ops_sweep():
     on-call sweep, so a paging tenant surfaces without having to be
     asked about by name."""
     return [r.__dict__ for r in check_all_tenants(service.telemetry, DEFAULT_SLO)]
+
+
+@app.get("/metrics")
+def metrics():
+    """Prometheus scrape target -- the same underlying state as
+    /ops/*, in the format a real monitoring stack actually consumes.
+    See metrics.py for why this needs its own module."""
+    body = render_metrics(service.telemetry, service.budgets, DEFAULT_SLO)
+    return Response(content=body, media_type="text/plain; version=0.0.4; charset=utf-8")

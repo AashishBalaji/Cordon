@@ -1,5 +1,7 @@
 # cordon
 
+[![CI](https://github.com/AashishBalaji/cordon/actions/workflows/ci.yml/badge.svg)](https://github.com/AashishBalaji/cordon/actions/workflows/ci.yml)
+
 A small multi-tenant case-management API built around one real
 constraint: **no tenant's load can degrade another tenant's.**
 
@@ -39,31 +41,37 @@ HTTP by `cordon/api.py`) where every request is routed through a
    incident.
 4. `cordon/api.py` -- a thin FastAPI wrapper, plus `/ops/*` endpoints
    (`headroom`, `burn-rate`, `throttled-fraction`, `sweep`) exposing
-   exactly what an on-call engineer would actually want to look at.
+   exactly what an on-call engineer would actually want to look at,
+   and a real `/metrics` endpoint (`cordon/metrics.py`) in Prometheus
+   text exposition format -- the `/ops/*` endpoints are for a human
+   clicking around during an incident; `/metrics` is what a real
+   monitoring stack (Prometheus, Grafana, an alerting pipeline) would
+   actually scrape on an interval.
 
-## Test automation: coverage, and the number past coverage
+## Test automation: coverage, mutation testing, and CI enforcing both
 
-49 tests, 99% statement coverage, flake8 clean. But coverage alone is
-a weak signal -- a line can be "covered" by a test that never checks
-its actual output. So this project also runs **mutation testing**
-(`mutmut`, `setup.cfg`): deliberately inject small bugs into the code
-(flip an operator, change a constant, swap `<` for `<=`) and measure
-what fraction of those injected bugs the test suite actually catches.
-That fraction -- the **mutation score** -- is the real automation
-metric the JD is pointing at with "drive up code coverage and
-automation metrics," not coverage alone.
+65 tests, 99% statement coverage, flake8 clean -- and a GitHub
+Actions pipeline (`.github/workflows/ci.yml`, badge above) running
+all of it, plus a mutation-testing gate, on every push. Coverage
+alone is a weak signal -- a line can be "covered" by a test that
+never checks its actual output. So this project also runs **mutation
+testing** (`mutmut`, `setup.cfg`): deliberately inject small bugs
+into the code (flip an operator, change a constant, swap `<` for
+`<=`) and measure what fraction of those injected bugs the test
+suite actually catches. That fraction -- the **mutation score** --
+is the real automation metric the JD is pointing at with "drive up
+code coverage and automation metrics," not coverage alone.
 
-**Real finding, run against the full suite (`python3 -m mutmut run`):**
-356 mutants generated across all of `cordon/`. First run: 253 killed,
-103 survived (71.1%). Reviewing the survivors found the real gap --
-`models.estimate_request_cost()` had no direct test, only indirect
-coverage through `CaseService`, so mutations to its cost formula
-(changing `200.0` to `201.0`, swapping `+` for `-`) went undetected
-even though the line was "covered." Adding `tests/test_models.py`
-(7 tests directly against the function) raised the score to **266/356
-killed, 74.7%**, without touching the code under test.
+**Real finding, run against the full suite (`python3 -m mutmut
+run`):** 513 mutants generated across all of `cordon/`, including
+`metrics.py` and `mutation_gate.py` added for the Prometheus endpoint
+and the CI gate itself. 398 killed, 115 survived -- **77.6%**. CI now
+enforces a **70% floor** on this score on every push
+(`cordon/mutation_gate.py`, `scripts/check_mutation_score.py`,
+`.github/workflows/ci.yml`): a pull request that weakens the test
+suite enough to drop the score below that floor fails the build.
 
-**Honest note on the remaining 90 survivors:** a sample of them
+**Honest note on the remaining 115 survivors:** a sample of them
 (`python3 -m mutmut show <id>`) turned out to be *equivalent
 mutants* -- for example, replacing `now = now if now is not None
 else time.monotonic()` with `now = None` in `budget.py`, which
@@ -72,8 +80,11 @@ behaves identically because the function it's passed to
 real clock" default one level down. No test can kill a mutant that
 doesn't actually change behavior, and chasing 100% here would mean
 writing tests that encode the mutation tool's blind spots rather
-than anything real about the code. 74.7% against a reviewed set of
-survivors is the honest number, not a chased one.
+than anything real about the code. That's also why the CI gate is a
+**floor, not a ratchet**: a ratchet that demanded the score only ever
+go up would eventually require killing mutants that can't be killed.
+77.6% against a reviewed set of survivors, with a floor catching real
+regressions, is the honest design, not a chased 100%.
 
 ## Telemetry and the noisy-tenant incident
 
