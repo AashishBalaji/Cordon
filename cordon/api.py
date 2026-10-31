@@ -10,9 +10,10 @@ from __future__ import annotations
 
 from dataclasses import asdict
 
-from fastapi import FastAPI, Header, HTTPException, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Response
 from pydantic import BaseModel
 
+from .auth import InvalidTenantToken, verify_tenant_token
 from .budget import BudgetExceeded
 from .metrics import render_metrics
 from .service import CaseNotFound, CaseService
@@ -47,8 +48,21 @@ class CreateCaseRequest(BaseModel):
     description: str = ""
 
 
+def tenant_id_from_token(x_tenant_token: str = Header(...)) -> str:
+    """Every endpoint below depends on this instead of reading
+    `X-Tenant-Id` directly. The id this returns is the one the
+    signature actually proved, not a value the caller merely typed
+    into a header -- see auth.py for why that distinction is the
+    whole point. An unverifiable token is a 401, not a 500: a bad
+    identity claim is the client's problem, not this service's."""
+    try:
+        return verify_tenant_token(x_tenant_token)
+    except InvalidTenantToken as e:
+        raise HTTPException(status_code=401, detail=str(e))
+
+
 @app.post("/cases")
-def create_case(body: CreateCaseRequest, x_tenant_id: str = Header(...)):
+def create_case(body: CreateCaseRequest, x_tenant_id: str = Depends(tenant_id_from_token)):
     try:
         case = service.create_case(x_tenant_id, body.subject, body.description)
     except BudgetExceeded as e:
@@ -57,7 +71,7 @@ def create_case(body: CreateCaseRequest, x_tenant_id: str = Header(...)):
 
 
 @app.get("/cases/{case_id}")
-def get_case(case_id: str, x_tenant_id: str = Header(...)):
+def get_case(case_id: str, x_tenant_id: str = Depends(tenant_id_from_token)):
     try:
         case = service.get_case(x_tenant_id, case_id)
     except BudgetExceeded as e:
@@ -68,7 +82,7 @@ def get_case(case_id: str, x_tenant_id: str = Header(...)):
 
 
 @app.get("/cases")
-def list_cases(x_tenant_id: str = Header(...)):
+def list_cases(x_tenant_id: str = Depends(tenant_id_from_token)):
     try:
         cases = service.list_cases(x_tenant_id)
     except BudgetExceeded as e:
@@ -77,7 +91,7 @@ def list_cases(x_tenant_id: str = Header(...)):
 
 
 @app.post("/cases/{case_id}/close")
-def close_case(case_id: str, x_tenant_id: str = Header(...)):
+def close_case(case_id: str, x_tenant_id: str = Depends(tenant_id_from_token)):
     try:
         case = service.close_case(x_tenant_id, case_id)
     except BudgetExceeded as e:
@@ -88,14 +102,14 @@ def close_case(case_id: str, x_tenant_id: str = Header(...)):
 
 
 @app.get("/ops/headroom")
-def ops_headroom(x_tenant_id: str = Header(...)):
+def ops_headroom(x_tenant_id: str = Depends(tenant_id_from_token)):
     """What an on-call engineer checks first: how close this tenant
     is to its own budget, before anything actually breaks."""
     return service.budgets.headroom(x_tenant_id)
 
 
 @app.get("/ops/burn-rate")
-def ops_burn_rate(x_tenant_id: str = Header(...)):
+def ops_burn_rate(x_tenant_id: str = Depends(tenant_id_from_token)):
     """Single-window SLO burn rate for one tenant -- the simple
     building block. /ops/burn-rate-multi-window is the actual paging
     decision; this stays for the single number on its own."""
@@ -104,7 +118,7 @@ def ops_burn_rate(x_tenant_id: str = Header(...)):
 
 
 @app.get("/ops/burn-rate-multi-window")
-def ops_burn_rate_multi_window(x_tenant_id: str = Header(...)):
+def ops_burn_rate_multi_window(x_tenant_id: str = Depends(tenant_id_from_token)):
     """The real paging decision: multi-window, multi-burn-rate rules
     (see slo.py) -- pages only when a fast-burn or slow-burn rule's
     long AND short windows both agree, so a single noisy window
@@ -115,7 +129,7 @@ def ops_burn_rate_multi_window(x_tenant_id: str = Header(...)):
 
 
 @app.get("/ops/throttled-fraction")
-def ops_throttled_fraction(x_tenant_id: str = Header(...)):
+def ops_throttled_fraction(x_tenant_id: str = Depends(tenant_id_from_token)):
     """Distinct from burn rate on purpose: how much of this tenant's
     own traffic is being contained by its own budget right now."""
     return {"tenant_id": x_tenant_id, "throttled_fraction": throttled_fraction(

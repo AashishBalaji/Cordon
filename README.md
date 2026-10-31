@@ -41,7 +41,12 @@ HTTP by `cordon/api.py`) where every request is routed through a
    not just how many errors happened -- and a tenant correctly
    throttled by its own budget is deliberately excluded from this
    calculation, because that's the system working, not an incident.
-4. `cordon/api.py` -- a thin FastAPI wrapper, plus `/ops/*` endpoints
+4. `cordon/auth.py` -- every tenant-scoped endpoint verifies a signed
+   `X-Tenant-Token` (HMAC-SHA256) rather than trusting a bare
+   `X-Tenant-Id` header. Without this, the entire isolation guarantee
+   above is worthless against a client that simply lies about who it
+   is -- see "Closing the tenant-identity gap" below.
+5. `cordon/api.py` -- a thin FastAPI wrapper, plus `/ops/*` endpoints
    (`headroom`, `burn-rate`, `throttled-fraction`, `sweep`) exposing
    exactly what an on-call engineer would actually want to look at,
    and a real `/metrics` endpoint (`cordon/metrics.py`) in Prometheus
@@ -52,7 +57,7 @@ HTTP by `cordon/api.py`) where every request is routed through a
 
 ## Test automation: coverage, mutation testing, and CI enforcing both
 
-79 tests, 99% statement coverage, flake8 clean -- and a GitHub
+91 tests, 99% statement coverage, flake8 clean -- and a GitHub
 Actions pipeline (`.github/workflows/ci.yml`, badge above) running
 all of it, plus a mutation-testing gate, on every push. Coverage
 alone is a weak signal -- a line can be "covered" by a test that
@@ -65,16 +70,17 @@ is the real automation metric the JD is pointing at with "drive up
 code coverage and automation metrics," not coverage alone.
 
 **Real finding, run against the full suite (`python3 -m mutmut
-run`):** 616 mutants generated across all of `cordon/` (the count
+run`):** 698 mutants generated across all of `cordon/` (the count
 keeps growing with the project -- `metrics.py`/`mutation_gate.py` for
 the Prometheus endpoint and CI gate, then the multi-window SLO logic
-and the concurrency locks added after). 484 killed, 132 survived --
-**78.6%**. CI enforces a **70% floor** on this score on every push
-(`cordon/mutation_gate.py`, `scripts/check_mutation_score.py`,
-`.github/workflows/ci.yml`): a pull request that weakens the test
-suite enough to drop the score below that floor fails the build.
+and concurrency locks, then `auth.py`'s tenant-token verification).
+534 killed, 164 survived -- **76.5%**. CI enforces a **70% floor** on
+this score on every push (`cordon/mutation_gate.py`,
+`scripts/check_mutation_score.py`, `.github/workflows/ci.yml`): a
+pull request that weakens the test suite enough to drop the score
+below that floor fails the build.
 
-**Honest note on the remaining 132 survivors:** a sample of them
+**Honest note on the remaining 164 survivors:** a sample of them
 (`python3 -m mutmut show <id>`) turned out to be *equivalent
 mutants* -- for example, replacing `now = now if now is not None
 else time.monotonic()` with `now = None` in `budget.py`, which
@@ -86,7 +92,7 @@ writing tests that encode the mutation tool's blind spots rather
 than anything real about the code. That's also why the CI gate is a
 **floor, not a ratchet**: a ratchet that demanded the score only ever
 go up would eventually require killing mutants that can't be killed.
-78.6% against a reviewed set of survivors, with a floor catching real
+76.5% against a reviewed set of survivors, with a floor catching real
 regressions, is the honest design, not a chased 100%.
 
 ## Telemetry and the noisy-tenant incident
@@ -143,6 +149,33 @@ actually for: an incident whose errors are now outside the short
 window but still inside the long one does **not** page, because the
 long window alone isn't enough -- fast recovery is the point.
 
+## Closing the tenant-identity gap
+
+Every endpoint used to read `X-Tenant-Id` as a bare, client-supplied
+header and trust it outright -- which meant the isolation guarantee
+this whole project is built around was worthless against a client
+that simply lied about who it was. `cordon/auth.py` fixes this:
+tenants now present a signed `X-Tenant-Token` (HMAC-SHA256 over the
+tenant id, verified with `hmac.compare_digest` to avoid a timing
+side-channel), and every endpoint uses the tenant id the signature
+actually proved, never the raw header. `tests/test_auth.py` tests
+the signing/verification logic directly -- including the specific
+attack this exists to stop: taking a token that validly verifies for
+one tenant and splicing a different tenant id onto its signature,
+which must not verify. `tests/test_api.py` tests the same thing
+wired into HTTP (a bare, unsigned id is now a 401, not an accepted
+identity).
+
+Honest scope on this fix: in a real deployment, issuing tokens is an
+upstream identity provider's or API gateway's job, with a securely
+managed and rotated signing key (a KMS secret) -- this service only
+ever verifies. The module-level fallback secret here exists so the
+project runs without any setup, and is explicitly not how a real
+deployment should source its key (see `auth.py`'s own docstring).
+`issue_tenant_token` is never exposed over HTTP for the same reason
+an unauthenticated "token for any tenant" endpoint would just move
+the trust problem one hop over, not close it.
+
 ## Honest scope, stated plainly
 
 - This is a portfolio project built to demonstrate engineering
@@ -156,6 +189,11 @@ long window alone isn't enough -- fast recovery is the point.
 - The in-memory store (`CaseService._cases`) is not a real database;
   this project is about the isolation and telemetry layers, not
   persistence.
+- Tenant identity is now verified (see above), but the signing key
+  itself is a process-local fallback, not a real KMS-backed secret,
+  and the `/ops/sweep*` admin endpoints (which intentionally aggregate
+  across every tenant) still have no operator-level auth of their own
+  -- a real deployment would gate those separately from tenant tokens.
 
 ## Run it
 
