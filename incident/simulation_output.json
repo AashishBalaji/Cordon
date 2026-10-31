@@ -1,0 +1,31 @@
+{
+  "scenario": "noisy-tenant sends 80 requests against a budget sized for far fewer; quiet-tenant sends 15 ordinary requests throughout",
+  "noisy_tenant": {
+    "requests_sent": 80,
+    "outcomes": {
+      "success": 50,
+      "throttled": 30
+    },
+    "throttled_fraction": 0.375,
+    "slo_burn_rate": 0.0,
+    "slo_should_page": false,
+    "headroom": {
+      "request_rate": 0.0001875515999927302,
+      "resource_cost": 0.6912875515999951
+    }
+  },
+  "quiet_tenant": {
+    "requests_sent": 15,
+    "outcomes": {
+      "success": 15,
+      "throttled": 0
+    },
+    "throttled_fraction": 0.0,
+    "slo_burn_rate": 0.0,
+    "slo_should_page": false,
+    "headroom": {
+      "request_rate": 0.7000381573999903,
+      "resource_cost": 0.9072881573999905
+    }
+  }
+}
